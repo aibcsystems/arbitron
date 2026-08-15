@@ -12,7 +12,10 @@
 //    - Logon (35=A) with username/password auth (553/554)
 //    - Heartbeat (35=0) sent on a fixed interval, and reply to
 //      TestRequest (35=1) with a Heartbeat, per the FIX spec
-//    - NewOrderSingle (35=D) for IOC limit orders
+//    - NewOrderSingle (35=D) for IOC limit orders, or Market orders
+//      (OrdType=1, no Price tag) when order.Type is OrderTypeMarket
+//      — used by execution.reverseHedge to force-flatten an
+//      unhedged position.
 //    - ExecutionReport (35=8) parsing, matched back to the
 //      originating order via ClOrdID (tag 11)
 //
@@ -203,16 +206,32 @@ func (f *FIXAdapter) SubmitIOC(ctx context.Context, order exchange.Order) exchan
 		f.pendingMu.Unlock()
 	}()
 
-	msg := f.buildMessage("D", map[int]string{
+	// Reverse-hedge orders (engine.go's reverseHedge) carry
+	// Type: OrderTypeMarket. Before this branch existed, every
+	// NewOrderSingle hardcoded OrdType=2 (Limit) with tag 44
+	// (Price) set to order.LimitPrice — for a reverse order that's
+	// the zero value, meaning "buy at $0" (never fills) or "sell at
+	// $0" (fills by accident). FIX OrdType=1 (Market) per spec
+	// carries no Price tag at all — sending tag 44 alongside
+	// OrdType=1 is itself a spec violation many venues will reject,
+	// so it's omitted entirely for market orders rather than sent
+	// as zero.
+	fields := map[int]string{
 		11: order.ID,
 		55: order.Symbol,
 		54: side,
 		38: strconv.FormatFloat(order.Quantity, 'f', -1, 64),
-		40: "2", // OrdType = Limit
-		44: strconv.FormatFloat(order.LimitPrice, 'f', -1, 64),
 		59: "3", // TimeInForce = IOC
 		60: time.Now().UTC().Format("20060102-15:04:05.000"),
-	})
+	}
+	if order.Type == exchange.OrderTypeMarket {
+		fields[40] = "1" // OrdType = Market
+	} else {
+		fields[40] = "2" // OrdType = Limit
+		fields[44] = strconv.FormatFloat(order.LimitPrice, 'f', -1, 64)
+	}
+
+	msg := f.buildMessage("D", fields)
 
 	if err := f.writeMessage(msg); err != nil {
 		return failResult(order.ID, "FIX_DIRECT", start, fmt.Errorf("send NewOrderSingle: %w", err))

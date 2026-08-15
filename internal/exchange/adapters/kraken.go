@@ -86,13 +86,25 @@ func (k *KrakenAdapter) SubmitIOC(ctx context.Context, order exchange.Order) exc
 		side = "sell"
 	}
 
+	// Reverse-hedge orders (engine.go's reverseHedge) carry
+	// Type: OrderTypeMarket. Kraken Futures' sendorder endpoint
+	// supports a true market order via orderType="mkt" — before this
+	// branch existed, reverse orders went out as orderType="ioc"
+	// with limitPrice=order.LimitPrice's zero value, which silently
+	// turned "flatten this position now" into "buy at $0" (never
+	// fills) or "sell at $0" (fills by accident, not by design).
+	// limitPrice is omitted entirely for market orders below.
 	form := url.Values{}
-	form.Set("orderType", "ioc")
 	form.Set("symbol", order.Symbol)
 	form.Set("side", side)
 	form.Set("size", strconv.FormatFloat(order.Quantity, 'f', -1, 64))
-	form.Set("limitPrice", strconv.FormatFloat(order.LimitPrice, 'f', -1, 64))
 	form.Set("cliOrdId", order.ID)
+	if order.Type == exchange.OrderTypeMarket {
+		form.Set("orderType", "mkt")
+	} else {
+		form.Set("orderType", "ioc")
+		form.Set("limitPrice", strconv.FormatFloat(order.LimitPrice, 'f', -1, 64))
+	}
 	postData := form.Encode()
 
 	const endpointPath = "/api/v3/sendorder"

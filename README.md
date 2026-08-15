@@ -50,6 +50,26 @@ track record.
 
 ## Recent fixes
 
+- **Reverse-hedge orders silently sent as $0 limit orders** (`internal/exchange/adapters/binance.go`,
+  `kraken.go`, `fix.go`): `engine.go`'s `reverseHedge` sets `Type: OrderMarket` on
+  every reverse (flatten-exposure) order — but all three live adapters ignored
+  `order.Type` entirely and always built a LIMIT/IOC order using `order.LimitPrice`,
+  which is the zero value for a reverse order. A BUY at $0 never fills (guaranteed
+  KILL_SWITCH on what should have been a recoverable partial), and a SELL at $0
+  fills but at zero real intent — the market-order semantics were never actually
+  communicated to any venue. Fixed by branching on `order.Type == exchange.OrderTypeMarket`
+  in all three adapters and omitting the price/limit fields entirely on that path
+  (each venue's market-order wire format, verified against docs: Binance
+  `type=MARKET`, Kraken `orderType=mkt`, FIX `OrdType=1` with no tag 44).
+  ⚠ Binance/FIX adapters are still not live-tested against a real or testnet
+  endpoint — validate on `testnet.binancefuture.com` before this handles real
+  capital.
+- **Execution test matrix closed** (`internal/execution/matrix_test.go`): added the
+  three previously-uncovered cells — partial reversal (reverse fill lands between
+  0 and the full residual, still KILL_SWITCH, `dailyPnL` must stay untouched),
+  subsequent-opportunity rejection after a real kill-switch trip (not just the
+  risk engine's flag in isolation), and recovery after `ResetKillSwitch` actually
+  resuming clean execution end-to-end.
 - **Reverse-hedge slippage on partial leg-2 fills** (`internal/execution/engine.go`):
   `calculateReverseSlippage` was pricing the reversal against `leg1`'s full
   filled quantity instead of the quantity actually being reversed, producing

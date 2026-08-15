@@ -81,16 +81,35 @@ func (b *BinanceAdapter) SubmitIOC(ctx context.Context, order exchange.Order) ex
 		side = "SELL"
 	}
 
+	// Reverse-hedge orders (engine.go's reverseHedge) carry
+	// Type: OrderTypeMarket — they must guarantee a fill to flatten
+	// unhedged exposure, not sit at a price. Before this branch
+	// existed, every order — including these — went out as
+	// type=LIMIT with price=order.LimitPrice, whose zero value for
+	// a reverse order meant "buy at $0" (never fills, guaranteed
+	// KILL_SWITCH) or "sell at $0" (fills, but only by accident of
+	// the floor being zero, not because market intent was ever
+	// communicated to Binance).
+	//
+	// Binance USDM futures: a true MARKET order takes no `price`
+	// and no `timeInForce` at all — sending either is at best
+	// ignored, at worst rejected, so they're omitted entirely below
+	// rather than sent as empty/zero values.
 	params := url.Values{}
 	params.Set("symbol", order.Symbol)
 	params.Set("side", side)
-	params.Set("type", "LIMIT")
-	params.Set("timeInForce", "IOC")
 	params.Set("quantity", strconv.FormatFloat(order.Quantity, 'f', -1, 64))
-	params.Set("price", strconv.FormatFloat(order.LimitPrice, 'f', -1, 64))
 	params.Set("newClientOrderId", order.ID)
 	params.Set("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
 	params.Set("recvWindow", "5000")
+
+	if order.Type == exchange.OrderTypeMarket {
+		params.Set("type", "MARKET")
+	} else {
+		params.Set("type", "LIMIT")
+		params.Set("timeInForce", "IOC")
+		params.Set("price", strconv.FormatFloat(order.LimitPrice, 'f', -1, 64))
+	}
 
 	query := params.Encode()
 	query += "&signature=" + b.sign(query)
