@@ -42,6 +42,7 @@ func NewGateway(addr string, p *redis.StreamPipeline, r *risk.Engine, registry *
 func (g *Gateway) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/events", g.sseHandler)
+	mux.HandleFunc("/opportunities", g.opportunitiesHandler)
 	mux.HandleFunc("/ws", g.wsHandler)
 	mux.HandleFunc("/health", g.healthHandler)
 	mux.HandleFunc("/risk", g.riskSnapshotHandler)
@@ -147,6 +148,64 @@ func (g *Gateway) sseHandler(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) wsHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Gateway] WS client connected: %s (serving via SSE protocol)", r.RemoteAddr)
 	g.sseHandler(w, r)
+}
+
+// ── Opportunity/execution feed (/opportunities) ──────────
+// Surfaces live ExecutionEvent records (opportunity ID, outcome,
+// PnL, per-leg fill results) as they happen. Previously these were
+// only written to the Redis execution stream via XAdd — nothing
+// pushed them to a live client. Added so dashboards can show real
+// executions instead of static/demo data.
+//
+// ⚠ KNOWN GAP: ExecutionEvent (internal/execution/engine.go) does
+// not carry the traded symbol/pair — FillResult has Exchange but no
+// Symbol field, even though Order.Symbol exists upstream. Until
+// that's threaded through, consumers of this feed get OpportunityID/
+// Outcome/PnL/latency but no human-readable pair label (e.g.
+// "BTC/USDT"). Flagged rather than patched here since engine.go
+// changes need a real build/test environment to verify safely.
+
+func (g *Gateway) opportunitiesHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+
+	ch := g.pipeline.SubscribeExecutions()
+	defer g.pipeline.UnsubscribeExecutions(ch)
+
+	log.Printf("[Gateway] Opportunity feed client connected: %s", r.RemoteAddr)
+
+	fmt.Fprintf(w, "event: connected\ndata: {\"status\":\"connected\"}\n\n")
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			log.Printf("[Gateway] Opportunity feed client disconnected: %s", r.RemoteAddr)
+			return
+
+		case <-heartbeat.C:
+			fmt.Fprintf(w, ": heartbeat\n\n")
+			flusher.Flush()
+
+		case data, ok := <-ch:
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "event: execution\ndata: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
 }
 
 // ── Risk snapshot ─────────────────────────────────────────

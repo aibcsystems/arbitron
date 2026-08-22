@@ -59,6 +59,12 @@ type StreamPipeline struct {
 	telemetrySubs []chan TelemetryFrame
 	subMu         sync.RWMutex
 
+	// Execution/opportunity event fan-out — added so the gateway can
+	// surface live execution events (previously only written to the
+	// Redis stream via XAdd, never pushed to any live subscriber).
+	executionSubs []chan []byte
+	execMu        sync.RWMutex
+
 	// Price tick fan-out for arb detector
 	tickSubs []chan PriceTick
 	tickMu   sync.RWMutex
@@ -121,17 +127,31 @@ func (p *StreamPipeline) PublishTelemetry(frame TelemetryFrame) error {
 // ── PublishExecution ──────────────────────────────────────
 
 func (p *StreamPipeline) PublishExecution(event interface{}) error {
-	// Same guard as PublishTelemetry: a nil/unavailable Redis client
-	// (test harnesses, or a real outage in production) must not crash
-	// the execution engine mid-trade. Losing the audit-trail write is
-	// a real problem to alert on — but it must never be a panic.
-	if p.client == nil {
-		return nil
-	}
-
 	data, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("marshal execution event: %w", err)
+	}
+
+	// Fan-out to live SSE/WS subscribers happens regardless of Redis
+	// availability — the dashboard should stay live even if the
+	// Redis audit-trail write below fails or there's no client
+	// (test harnesses). Non-blocking: a slow/stalled subscriber
+	// drops frames rather than backpressuring the execution engine.
+	p.execMu.RLock()
+	for _, ch := range p.executionSubs {
+		select {
+		case ch <- data:
+		default:
+		}
+	}
+	p.execMu.RUnlock()
+
+	// Same guard as PublishTelemetry: a nil/unavailable Redis client
+	// must not crash the execution engine mid-trade. Losing the
+	// audit-trail write is a real problem to alert on — but it must
+	// never be a panic, and it must not suppress the live fan-out above.
+	if p.client == nil {
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -146,6 +166,29 @@ func (p *StreamPipeline) PublishExecution(event interface{}) error {
 			"ts":   time.Now().UnixMilli(),
 		},
 	}).Err()
+}
+
+// SubscribeExecutions registers a new live subscriber for execution
+// events (raw JSON, already marshaled). Caller must call
+// UnsubscribeExecutions when done (e.g. on client disconnect).
+func (p *StreamPipeline) SubscribeExecutions() chan []byte {
+	ch := make(chan []byte, 64)
+	p.execMu.Lock()
+	defer p.execMu.Unlock()
+	p.executionSubs = append(p.executionSubs, ch)
+	return ch
+}
+
+func (p *StreamPipeline) UnsubscribeExecutions(ch chan []byte) {
+	p.execMu.Lock()
+	defer p.execMu.Unlock()
+	for i, sub := range p.executionSubs {
+		if sub == ch {
+			p.executionSubs = append(p.executionSubs[:i], p.executionSubs[i+1:]...)
+			close(ch)
+			break
+		}
+	}
 }
 
 // ── PublishTick ───────────────────────────────────────────
