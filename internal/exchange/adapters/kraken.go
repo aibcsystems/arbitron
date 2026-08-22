@@ -34,6 +34,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -51,11 +52,20 @@ type KrakenAdapter struct {
 }
 
 func NewKrakenAdapter(apiKey, apiSecret string) *KrakenAdapter {
+	baseURL := krakenBaseURL
+	// Testnet override — set KRAKEN_BASE_URL=https://demo-futures.kraken.com
+	// for paper-trading validation before pointing at production. Mirrors
+	// the same override pattern used in binance.go; added because this
+	// adapter previously had no way to route REST order calls to Kraken's
+	// demo endpoint (checklist Section 2 assumed this existed — it didn't).
+	if override := os.Getenv("KRAKEN_BASE_URL"); override != "" {
+		baseURL = override
+	}
 	return &KrakenAdapter{
 		apiKey:    apiKey,
 		apiSecret: apiSecret,
 		client:    &http.Client{Timeout: 5 * time.Second},
-		baseURL:   krakenBaseURL,
+		baseURL:   baseURL,
 	}
 }
 
