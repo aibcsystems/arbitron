@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"arbitron/config"
+	"arbitron/internal/exchange"
 	"arbitron/internal/redis"
 )
 
@@ -30,9 +31,17 @@ type Quote struct {
 	UpdatedAt time.Time
 }
 
+// VenueHealthProvider exposes the execution gate's authoritative venue state.
+// Keeping this as a narrow interface prevents the detector from depending on
+// FeedManager internals and makes the gate deterministic in tests.
+type VenueHealthProvider interface {
+	GetHealth() map[string]exchange.FeedHealth
+}
+
 type Detector struct {
 	cfg    *config.Config
 	engine *Engine
+	health VenueHealthProvider
 
 	quotes   map[string]Quote
 	quotesMu sync.RWMutex
@@ -43,10 +52,19 @@ type Detector struct {
 	minSpreadBps float64
 }
 
-func NewDetector(cfg *config.Config, engine *Engine) *Detector {
+// NewDetector accepts an optional venue health provider. Without one the
+// detector retains legacy behavior for isolated callers/tests; production
+// wiring supplies FeedManager so stale/disconnected venues cannot generate
+// executable opportunities.
+func NewDetector(cfg *config.Config, engine *Engine, health ...VenueHealthProvider) *Detector {
+	var provider VenueHealthProvider
+	if len(health) > 0 {
+		provider = health[0]
+	}
 	return &Detector{
 		cfg:          cfg,
 		engine:       engine,
+		health:       provider,
 		quotes:       make(map[string]Quote),
 		lastOpp:      make(map[string]time.Time),
 		minSpreadBps: defaultMinSpreadBps,
@@ -93,6 +111,22 @@ func (d *Detector) onTick(tick redis.PriceTick) {
 	d.scanSymbol(tick.Symbol)
 }
 
+func (d *Detector) venueHealthy(exchangeName string) bool {
+	if d.health == nil {
+		return true
+	}
+	health, ok := d.health.GetHealth()[exchangeName]
+	if !ok {
+		return false
+	}
+	// FeedManager marks OPEN only after a live connection is established.
+	// CLOSED is deliberately not executable: it represents a disconnected
+	// or shutdown feed, while HALF_OPEN is a reconnect probe state.
+	return health.State == exchange.CircuitOpen &&
+		health.LastMessage.IsZero() == false &&
+		time.Since(health.LastMessage) <= time.Duration(maxQuoteAgeMs)*time.Millisecond
+}
+
 func (d *Detector) scanSymbol(symbol string) {
 	d.lastOppMu.Lock()
 	if last, ok := d.lastOpp[symbol]; ok && time.Since(last) < oppCooldown {
@@ -110,6 +144,9 @@ func (d *Detector) scanSymbol(symbol string) {
 			continue
 		}
 		if time.Since(q.UpdatedAt) > time.Duration(maxQuoteAgeMs)*time.Millisecond {
+			continue
+		}
+		if !d.venueHealthy(q.Exchange) {
 			continue
 		}
 		quotes = append(quotes, q)
@@ -150,12 +187,11 @@ func (d *Detector) scanSymbol(symbol string) {
 
 	qty := d.calcQuantity(bestBuy, spreadBps)
 	if qty <= 0 {
-		// Sized below MinPositionUSD — not worth the round-trip fees
-		// and likely to be rejected by exchange minimum-order rules.
 		return
 	}
 
-	opp := ArbOpportunity{
+	now := time.Now()
+	op := ArbOpportunity{
 		ID: oppID,
 		Leg1: Order{
 			ID:         oppID + "-L1",
@@ -175,12 +211,12 @@ func (d *Detector) scanSymbol(symbol string) {
 			Quantity:   qty,
 			LimitPrice: bestSell.Bid * 0.9999,
 		},
-		SpreadBps:  spreadBps,
-		DetectedAt: time.Now(),
+		SpreadBps:   spreadBps,
+		DetectedAt:  now,
 	}
 
 	d.lastOppMu.Lock()
-	d.lastOpp[symbol] = time.Now()
+	d.lastOpp[symbol] = now
 	d.lastOppMu.Unlock()
 
 	log.Printf("[Detector] 🎯 Opportunity: %s | %.2fbps | Buy %s Ask %.4f → Sell %s Bid %.4f",
@@ -189,51 +225,21 @@ func (d *Detector) scanSymbol(symbol string) {
 		bestSell.Exchange, bestSell.Bid,
 	)
 
-	d.engine.Submit(opp)
+	d.engine.Submit(op)
 }
 
 // ── calcQuantity — risk-driven position sizing ────────────
-//
-// P1 FIX: previously hardcoded to return 0.01 regardless of spread
-// or price — every opportunity sized identically, with no relation
-// to risk budget, spread quality, or notional value. That's a real
-// gap ahead of live capital: a 15bps spread and a 200bps spread got
-// the same size, and a $100 asset and a $100,000 asset got the same
-// unit quantity (wildly different notional exposure).
-//
-// Model:
-//   1. Base notional = BaseRiskPct × DailyLossLimit — the USD size a
-//      merely-adequate opportunity (spread == minSpreadBps) is allowed.
-//   2. Confidence scaling: wider spreads (more edge, more margin for
-//      slippage) scale the notional up, capped at 2x base. This is a
-//      confidence multiplier, not a leverage mechanism — it never
-//      exceeds MaxPositionUSD regardless of how wide the spread is.
-//   3. Hard clamp to [MinPositionUSD, MaxPositionUSD]. Below the floor,
-//      caller skips the opportunity entirely (fees would eat the edge
-//      and most exchanges reject sub-minimum orders anyway).
-//   4. Convert USD notional → base-asset quantity using the reference
-//      price (the buy-side ask, since that's the leg that sets cost).
-//
-// This still isn't full portfolio-aware sizing (no correlation across
-// concurrent open positions, no per-symbol exposure caps) — that's a
-// reasonable P2 improvement once real fill data exists to calibrate
-// against. This fixes the immediate gap: size is no longer constant
-// and no longer decoupled from risk budget or spread quality.
 func (d *Detector) calcQuantity(q Quote, spreadBps float64) float64 {
 	if q.Ask <= 0 {
 		return 0
 	}
 
 	rp := d.cfg.RiskParams
-
 	baseNotional := rp.BaseRiskPct * rp.DailyLossLimit
 	if baseNotional <= 0 {
 		baseNotional = rp.MinPositionUSD
 	}
 
-	// Confidence multiplier: linear scale from 1x at minSpreadBps up to
-	// 2x at 3×minSpreadBps or wider. Never exceeds 2x — width alone
-	// should not justify unbounded sizing.
 	confidence := 1.0
 	if d.minSpreadBps > 0 {
 		confidence = 1.0 + (spreadBps-d.minSpreadBps)/(2*d.minSpreadBps)
@@ -250,7 +256,7 @@ func (d *Detector) calcQuantity(q Quote, spreadBps float64) float64 {
 		notional = rp.MaxPositionUSD
 	}
 	if notional < rp.MinPositionUSD {
-		return 0 // caller treats <= 0 as "skip this opportunity"
+		return 0
 	}
 
 	return notional / q.Ask
