@@ -1,39 +1,6 @@
 // ============================================================
 //  internal/execution/engine.go — P0 PATCH
 //  Arbitron v4 — Execution Engine with Real Adapter Registry
-//
-//  Change from stub version:
-//    - submitToExchange(ctx, order) stub → registry.SubmitIOC()
-//    - Fee schedule reads from cfg.Fees (config-driven)
-//    - Engine constructor accepts AdapterRegistry
-//
-//  ★ THREE BUGS FIXED IN THIS FILE, ALL CONFIRMED BY ACTUALLY
-//  BUILDING THE CODE (not inferred from reading):
-//
-//  1. executeTwoLeg() called `e.risk.ValidateOpportunity()` with
-//     no arguments. risk.Engine.ValidateOpportunity needs the two
-//     legs. Fixed to pass them — see #2 for why they need converting.
-//
-//  2. risk.Engine.ValidateOpportunity takes risk.Order, not
-//     execution.Order — because internal/risk can't import
-//     internal/execution (that's a direct import cycle; confirmed
-//     by actually building the two packages together, see
-//     internal/risk/engine.go's header comment for the exact
-//     compiler error). So opp.Leg1 / opp.Leg2 are converted to
-//     risk.Order here before the call, exactly the same way this
-//     file already converts an Order to exchange.Order in
-//     submitIOC() below.
-//
-//  3. NewEngine's pipeline parameter was `p *redis.StreamPipeline`
-//     — a concrete type. engine_test.go's buildEngine() passes a
-//     *mockPipeline (a distinct local test type) into this exact
-//     parameter. Go does not allow that for concrete types — only
-//     for interfaces (confirmed with a minimal reproduction: passing
-//     a *Mock where a *Real is expected fails with "cannot use m
-//     (variable of type *Mock) as *Real value in argument to
-//     NewThing"). Fixed by introducing a small Pipeline interface
-//     that both *redis.StreamPipeline and the test's *mockPipeline
-//     already satisfy — zero changes needed to either of those.
 // ============================================================
 
 package execution
@@ -49,8 +16,6 @@ import (
 	"arbitron/internal/exchange"
 	"arbitron/internal/risk"
 )
-
-// ── Types unchanged from prior iteration ─────────────────
 
 type Side string
 
@@ -77,14 +42,26 @@ type Order struct {
 	SubmittedAt time.Time
 }
 
+// Resolution records whether an order result is directly confirmed by the
+// submit path or had to be resolved from authoritative exchange state.
+// UNKNOWN is fail-closed: callers must never infer that the order did not fill.
+type Resolution string
+
+const (
+	ResolutionDirect     Resolution = "DIRECT"
+	ResolutionReconciled Resolution = "RECONCILED"
+	ResolutionUnknown   Resolution = "UNKNOWN"
+)
+
 type FillResult struct {
-	OrderID   string
-	Filled    bool
-	FilledQty float64
-	AvgPrice  float64
-	Exchange  string
-	Latency   time.Duration
-	Error     error
+	OrderID    string
+	Filled     bool
+	FilledQty  float64
+	AvgPrice   float64
+	Exchange   string
+	Latency    time.Duration
+	Resolution Resolution
+	Error      error
 }
 
 type ArbOpportunity struct {
@@ -106,40 +83,28 @@ type ExecutionEvent struct {
 	Timestamp     time.Time
 }
 
-// ── Pipeline interface — fix #3 ───────────────────────────
-// *redis.StreamPipeline already has this exact method, so it
-// satisfies this interface with no changes. engine_test.go's
-// *mockPipeline does too — that's what makes the test buildable.
 type Pipeline interface {
 	PublishExecution(event interface{}) error
 }
 
-// ── Engine ────────────────────────────────────────────────
-
 type Engine struct {
 	cfg      *config.Config
 	risk     *risk.Engine
-	pipeline Pipeline                  // was *redis.StreamPipeline — see fix #3 above
-	registry *exchange.AdapterRegistry // Real adapters — stub replaced
+	pipeline Pipeline
+	registry *exchange.AdapterRegistry
 	oppCh    chan ArbOpportunity
 	mu       sync.Mutex
 	dailyPnL float64
 
-	// inFlight guards against a second opportunity on the same symbol
-	// launching while a prior one is still resolving. Necessary once
-	// any venue in play has real-world latency measured in hundreds
-	// of ms to seconds (e.g. Alpaca's REST+poll fill confirmation) —
-	// without this, two opportunities on BTC/USD 1s apart both start
-	// executing concurrently, and a late-arriving reverse-hedge result
-	// from the first can get misread as a failure on the second,
-	// tripping the kill switch on a false positive (observed in
-	// pipelinetest: two overlapping BTC/USD opps → spurious KILL_SWITCH).
 	inFlight   map[string]bool
 	inFlightMu sync.Mutex
 }
 
-// NewEngine accepts any Pipeline (fix #3) and the real AdapterRegistry.
-// Wire: execution.NewEngine(cfg, riskEngine, pipeline, registry)
+// Reconciliation is deliberately bounded. If a venue cannot authoritatively
+// resolve an ambiguous order inside this window, Arbitron stops rather than
+// guessing. The unresolved order may have filled after the local timeout.
+const reconciliationTimeout = 2 * time.Second
+
 func NewEngine(
 	cfg *config.Config,
 	r *risk.Engine,
@@ -177,8 +142,6 @@ func (e *Engine) Submit(opp ArbOpportunity) {
 	}
 }
 
-// ── toRiskOrder — fix #2: convert execution.Order → risk.Order ───
-// Same pattern already used below for exchange.Order in submitIOC.
 func toRiskOrder(o Order) risk.Order {
 	return risk.Order{
 		ID:         o.ID,
@@ -191,21 +154,11 @@ func toRiskOrder(o Order) risk.Order {
 	}
 }
 
-// ── Core two-leg execution loop ───────────────────────────
-
 func (e *Engine) executeTwoLeg(ctx context.Context, opp ArbOpportunity) {
-	// In-flight guard: skip if this symbol already has an opportunity
-	// resolving. Prevents concurrent executions on the same symbol from
-	// racing each other's reverse-hedge / kill-switch logic. Released
-	// via defer once this opportunity fully resolves (clean, reversed,
-	// or kill-switched) — not on a fixed timer, since venue latency
-	// varies too widely for a fixed cooldown to be safe (see struct
-	// comment on inFlight).
 	e.inFlightMu.Lock()
 	if e.inFlight[opp.Leg1.Symbol] {
 		e.inFlightMu.Unlock()
-		log.Printf("[Execution] ⏭ Skipping %s — %s already has an opportunity in flight",
-			opp.ID, opp.Leg1.Symbol)
+		log.Printf("[Execution] ⏭ Skipping %s — %s already has an opportunity in flight", opp.ID, opp.Leg1.Symbol)
 		return
 	}
 	e.inFlight[opp.Leg1.Symbol] = true
@@ -218,13 +171,8 @@ func (e *Engine) executeTwoLeg(ctx context.Context, opp ArbOpportunity) {
 	}()
 
 	start := time.Now()
-	event := ExecutionEvent{
-		OpportunityID: opp.ID,
-		State:         "CREATED",
-		Timestamp:     start,
-	}
+	event := ExecutionEvent{OpportunityID: opp.ID, State: "CREATED", Timestamp: start}
 
-	// Fix #1 + #2: pass both legs, converted to risk.Order.
 	if err := e.risk.ValidateOpportunity(toRiskOrder(opp.Leg1), toRiskOrder(opp.Leg2)); err != nil {
 		log.Printf("[Execution] Risk check failed for %s: %v", opp.ID, err)
 		event.Outcome = "RISK_REJECTED"
@@ -232,40 +180,30 @@ func (e *Engine) executeTwoLeg(ctx context.Context, opp ArbOpportunity) {
 		return
 	}
 
-	log.Printf("[Execution] ⚡ Executing opp %s | Spread: %.2fbps | %s→%s",
-		opp.ID, opp.SpreadBps, opp.Leg1.Exchange, opp.Leg2.Exchange)
+	log.Printf("[Execution] ⚡ Executing opp %s | Spread: %.2fbps | %s→%s", opp.ID, opp.SpreadBps, opp.Leg1.Exchange, opp.Leg2.Exchange)
 
-	// Per-venue timeout — a global 45ms budget times out real Alpaca
-	// fills (~1.3s observed round-trip) while being appropriate for
-	// WS-native venues. See config.RiskParams.LegTimeout.
 	event.State = "LEG1_PENDING"
 	leg1Timeout := e.cfg.RiskParams.LegTimeout(opp.Leg1.Exchange)
 	leg1Result := e.submitIOC(ctx, opp.Leg1, leg1Timeout)
 	event.Leg1Result = leg1Result
 
+	if leg1Result.Resolution == ResolutionUnknown {
+		e.abortUnknownOrder(&event, opp, "leg1", leg1Result)
+		e.emitEvent(event)
+		return
+	}
 	if !leg1Result.Filled || leg1Result.FilledQty <= 0 {
-		log.Printf("[Execution] Leg 1 miss on %s (latency: %v, err: %v)",
-			opp.ID, leg1Result.Latency, leg1Result.Error)
+		log.Printf("[Execution] Leg 1 miss on %s (latency: %v, err: %v)", opp.ID, leg1Result.Latency, leg1Result.Error)
 		event.Outcome = "MISSED"
 		e.emitEvent(event)
 		return
 	}
 
 	event.State = "LEG1_FILLED"
-	log.Printf("[Execution] ✅ Leg 1 filled: %s %.4f @ %.4f (latency: %v)",
-		leg1Result.Exchange, leg1Result.FilledQty, leg1Result.AvgPrice, leg1Result.Latency)
+	log.Printf("[Execution] ✅ Leg 1 filled: %s %.4f @ %.4f (latency: %v, resolution: %s)", leg1Result.Exchange, leg1Result.FilledQty, leg1Result.AvgPrice, leg1Result.Latency, leg1Result.Resolution)
 
 	elapsed := time.Since(start)
-	// Total budget derived from both legs' real per-venue timeouts,
-	// not the flat MaxLatencyMS default. A fixed 45ms total budget is
-	// structurally impossible to complete once either leg is on a
-	// REST+poll venue like Alpaca (Leg 1 alone can take 600ms-1.6s) —
-	// every trade would fill Leg 1 then immediately blow the total
-	// budget and reverse, regardless of how the reverse itself performs.
-	// +200ms buffer covers risk-check + dispatch overhead between legs.
-	totalBudget := e.cfg.RiskParams.LegTimeout(opp.Leg1.Exchange) +
-		e.cfg.RiskParams.LegTimeout(opp.Leg2.Exchange) +
-		200*time.Millisecond
+	totalBudget := e.cfg.RiskParams.LegTimeout(opp.Leg1.Exchange) + e.cfg.RiskParams.LegTimeout(opp.Leg2.Exchange) + 200*time.Millisecond
 	remainingBudget := totalBudget - elapsed
 
 	if remainingBudget <= 0 {
@@ -275,14 +213,20 @@ func (e *Engine) executeTwoLeg(ctx context.Context, opp ArbOpportunity) {
 		return
 	}
 
-	// Never submit more on leg 2 than leg 1 actually filled. A partial
-	// leg-1 fill creates a smaller exposure, and the hedge must match that
-	// exact quantity rather than the original requested quantity.
 	leg2Order := opp.Leg2
 	leg2Order.Quantity = leg1Result.FilledQty
 	event.State = "LEG2_PENDING"
 	leg2Result := e.submitIOC(ctx, leg2Order, remainingBudget)
 	event.Leg2Result = leg2Result
+
+	if leg2Result.Resolution == ResolutionUnknown {
+		// Do NOT reverse an unresolved leg-2 order. It may have filled after
+		// the local timeout; blindly reversing leg 1 could create a new,
+		// over-hedged position. Stop the strategy and require reconciliation.
+		e.abortUnknownOrder(&event, opp, "leg2", leg2Result)
+		e.emitEvent(event)
+		return
+	}
 
 	if leg2Result.Filled && leg2Result.FilledQty >= leg2Order.Quantity-1e-12 {
 		pnl := e.calculatePnL(leg1Result, leg2Result)
@@ -294,34 +238,46 @@ func (e *Engine) executeTwoLeg(ctx context.Context, opp ArbOpportunity) {
 		e.mu.Lock()
 		e.dailyPnL += pnl
 		e.mu.Unlock()
-
 		e.risk.RecordCleanExecution(pnl)
 
-		log.Printf("[Execution] ✅✅ Clean arb: %s | Net PnL (fee-adjusted): $%.4f | %v",
-			opp.ID, pnl, event.TotalLatency)
+		log.Printf("[Execution] ✅✅ Clean arb: %s | Net PnL (fee-adjusted): $%.4f | %v", opp.ID, pnl, event.TotalLatency)
 	} else {
-		// Any leg-2 partial fill reduces, but does not eliminate, the
-		// original leg-1 exposure. Reverse only the residual quantity.
 		residual := leg1Result.FilledQty - leg2Result.FilledQty
 		if residual < 0 {
 			residual = 0
 		}
-		log.Printf("[Execution] ❌ Leg 2 incomplete on %s — residual exposure %.8f. Reversing...", opp.ID, residual)
-		e.reverseHedge(ctx, opp, leg1Result, residual, &event)
+		if residual <= 1e-12 {
+			// Defensive guard against a venue reporting a slightly-short fill.
+			// No residual exposure remains, so do not manufacture a reverse.
+			event.State = "COMPLETED"
+			event.Outcome = "CLEAN"
+			event.PnL = e.calculatePnL(leg1Result, leg2Result)
+			event.TotalLatency = time.Since(start)
+		} else {
+			log.Printf("[Execution] ❌ Leg 2 incomplete on %s — residual exposure %.8f. Reversing...", opp.ID, residual)
+			e.reverseHedge(ctx, opp, leg1Result, residual, &event)
+		}
 	}
 
 	e.emitEvent(event)
 }
 
-// ── reverseHedge ──────────────────────────────────────────
+// abortUnknownOrder is the fail-closed terminal path for an order whose
+// exchange-side state could not be established. No automatic hedge is sent.
+func (e *Engine) abortUnknownOrder(event *ExecutionEvent, opp ArbOpportunity, leg string, result FillResult) {
+	event.State = "UNKNOWN_ORDER_STATE"
+	event.Outcome = "KILL_SWITCH"
+	log.Printf("[Execution] 🚨 UNKNOWN ORDER STATE — opp=%s leg=%s order=%s exchange=%s. No automatic reversal; manual reconciliation required. err=%v", opp.ID, leg, result.OrderID, result.Exchange, result.Error)
+	e.risk.TripKillSwitch(fmt.Sprintf("UNKNOWN_ORDER_STATE: opp=%s leg=%s order=%s exchange=%s", opp.ID, leg, result.OrderID, result.Exchange))
+}
 
-func (e *Engine) reverseHedge(
-	ctx context.Context,
-	opp ArbOpportunity,
-	leg1Result FillResult,
-	quantity float64,
-	event *ExecutionEvent,
-) {
+func (e *Engine) reverseHedge(ctx context.Context, opp ArbOpportunity, leg1Result FillResult, quantity float64, event *ExecutionEvent) {
+	if quantity <= 1e-12 {
+		event.State = "COMPLETED"
+		event.Outcome = "CLEAN"
+		return
+	}
+
 	reverseSide := SideSell
 	if opp.Leg1.Side == SideSell {
 		reverseSide = SideBuy
@@ -336,18 +292,17 @@ func (e *Engine) reverseHedge(
 		Quantity: quantity,
 	}
 
-	log.Printf("[Execution] 🔄 Reverse hedge: %s %s %.4f on %s",
-		reverseOrder.Side, reverseOrder.Symbol, reverseOrder.Quantity, reverseOrder.Exchange)
-
-	// Was hardcoded to 200ms — nowhere near enough for a REST+poll
-	// venue like Alpaca (observed ~1.3s for real fill confirmation).
-	// A hedge-flattening order is the LAST thing that should time out
-	// prematurely, since a real fill just arriving late still looks
-	// identical to "reverse failed" and trips the kill switch either
-	// way. Use the same per-venue timeout as Leg 1 — the reverse
-	// order is placed on opp.Leg1.Exchange, so look up that venue.
+	log.Printf("[Execution] 🔄 Reverse hedge: %s %s %.4f on %s", reverseOrder.Side, reverseOrder.Symbol, reverseOrder.Quantity, reverseOrder.Exchange)
 	reverseTimeout := e.cfg.RiskParams.LegTimeout(reverseOrder.Exchange)
 	reverseResult := e.submitIOC(ctx, reverseOrder, reverseTimeout)
+
+	if reverseResult.Resolution == ResolutionUnknown {
+		event.State = "UNKNOWN_ORDER_STATE"
+		event.Outcome = "KILL_SWITCH"
+		log.Printf("[Execution] 🚨 KILL SWITCH — Reverse order state unknown on %s. Manual intervention required.", opp.ID)
+		e.risk.TripKillSwitch(fmt.Sprintf("UNKNOWN_ORDER_STATE: opp=%s leg=reverse order=%s exchange=%s", opp.ID, reverseResult.OrderID, reverseResult.Exchange))
+		return
+	}
 
 	if reverseResult.Filled && reverseResult.FilledQty >= quantity-1e-12 {
 		event.State = "REVERSED"
@@ -358,7 +313,6 @@ func (e *Engine) reverseHedge(
 		e.mu.Lock()
 		e.dailyPnL += pnl
 		e.mu.Unlock()
-
 		e.risk.RecordReversal(pnl)
 		log.Printf("[Execution] ✅ Reverse filled — exposure closed. Slippage: $%.4f", pnl)
 	} else {
@@ -369,13 +323,13 @@ func (e *Engine) reverseHedge(
 			remaining = 0
 		}
 		log.Printf("[Execution] 🚨 KILL SWITCH — Reverse incomplete on %s. Remaining exposure: %.8f. Manual intervention required.", opp.ID, remaining)
-		e.risk.TripKillSwitch(fmt.Sprintf("UNHEDGED_EXPOSURE: opp=%s leg1_fill=%.4f",
-			opp.ID, leg1Result.FilledQty))
+		e.risk.TripKillSwitch(fmt.Sprintf("UNHEDGED_EXPOSURE: opp=%s leg1_fill=%.4f", opp.ID, leg1Result.FilledQty))
 	}
 }
 
-// ── submitIOC — wired to real AdapterRegistry ─────────────
-
+// submitIOC never treats a local timeout as proof of non-fill. It first asks
+// the venue for authoritative state. Only a terminal exchange response can
+// produce a normal missed/partial/filled decision. Unresolved state fails closed.
 func (e *Engine) submitIOC(ctx context.Context, order Order, timeout time.Duration) FillResult {
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -395,13 +349,14 @@ func (e *Engine) submitIOC(ctx context.Context, order Order, timeout time.Durati
 		exResult := e.registry.SubmitIOC(timeoutCtx, order.Exchange, exOrder)
 
 		result := FillResult{
-			OrderID:   exResult.OrderID,
-			Filled:    exResult.Filled,
-			FilledQty: exResult.FilledQty,
-			AvgPrice:  exResult.AvgPrice,
-			Exchange:  exResult.Exchange,
-			Latency:   time.Since(submitted),
-			Error:     exResult.Error,
+			OrderID:    exResult.OrderID,
+			Filled:     exResult.Filled,
+			FilledQty:  exResult.FilledQty,
+			AvgPrice:   exResult.AvgPrice,
+			Exchange:   exResult.Exchange,
+			Latency:    time.Since(submitted),
+			Resolution: ResolutionDirect,
+			Error:      exResult.Error,
 		}
 
 		select {
@@ -414,20 +369,35 @@ func (e *Engine) submitIOC(ctx context.Context, order Order, timeout time.Durati
 	case result := <-resultCh:
 		return result
 	case <-timeoutCtx.Done():
-		return FillResult{
-			OrderID:  order.ID,
-			Filled:   false,
-			Exchange: order.Exchange,
-			Latency:  timeout,
-			Error:    fmt.Errorf("IOC timeout after %v: %w", timeout, timeoutCtx.Err()),
+		if ctx.Err() != nil {
+			return FillResult{OrderID: order.ID, Exchange: order.Exchange, Latency: time.Since(submitted), Resolution: ResolutionUnknown, Error: fmt.Errorf("context cancelled before order state resolved: %w", ctx.Err())}
 		}
+		return e.reconcileTimedOutOrder(ctx, order, submitted, timeout)
 	case <-ctx.Done():
-		return FillResult{
-			OrderID:  order.ID,
-			Filled:   false,
-			Exchange: order.Exchange,
-			Error:    fmt.Errorf("context cancelled: %w", ctx.Err()),
+		return FillResult{OrderID: order.ID, Exchange: order.Exchange, Latency: time.Since(submitted), Resolution: ResolutionUnknown, Error: fmt.Errorf("context cancelled: %w", ctx.Err())}
+	}
+}
+
+func (e *Engine) reconcileTimedOutOrder(parent context.Context, order Order, submitted time.Time, submitTimeout time.Duration) FillResult {
+	reconcileCtx, cancel := context.WithTimeout(parent, reconciliationTimeout)
+	defer cancel()
+
+	status := e.registry.ReconcileOrder(reconcileCtx, order.Exchange, order.ID, order.Symbol)
+	latency := time.Since(submitted)
+
+	switch status.State {
+	case exchange.OrderStateFilled:
+		return FillResult{OrderID: order.ID, Filled: true, FilledQty: status.FilledQty, AvgPrice: status.AvgPrice, Exchange: order.Exchange, Latency: latency, Resolution: ResolutionReconciled, Error: status.Error}
+	case exchange.OrderStatePartiallyFilled:
+		return FillResult{OrderID: order.ID, Filled: status.FilledQty > 0, FilledQty: status.FilledQty, AvgPrice: status.AvgPrice, Exchange: order.Exchange, Latency: latency, Resolution: ResolutionReconciled, Error: status.Error}
+	case exchange.OrderStateCancelled, exchange.OrderStateRejected, exchange.OrderStateNotFound:
+		return FillResult{OrderID: order.ID, Filled: false, FilledQty: status.FilledQty, AvgPrice: status.AvgPrice, Exchange: order.Exchange, Latency: latency, Resolution: ResolutionReconciled, Error: status.Error}
+	default:
+		err := status.Error
+		if err == nil {
+			err = fmt.Errorf("exchange order state unresolved after %v reconciliation window (submit timeout %v)", reconciliationTimeout, submitTimeout)
 		}
+		return FillResult{OrderID: order.ID, Filled: status.FilledQty > 0, FilledQty: status.FilledQty, AvgPrice: status.AvgPrice, Exchange: order.Exchange, Latency: latency, Resolution: ResolutionUnknown, Error: err}
 	}
 }
 
@@ -436,8 +406,6 @@ func (e *Engine) emitEvent(event ExecutionEvent) {
 		log.Printf("[Execution] ⚠ Failed to emit execution event: %v", err)
 	}
 }
-
-// ── Fee schedule — config-driven (P2 audit fix applied) ──
 
 func (e *Engine) getTakerFeeRate(exch string) float64 {
 	fees := e.cfg.Fees
@@ -464,14 +432,6 @@ func (e *Engine) calculatePnL(leg1, leg2 FillResult) float64 {
 }
 
 func (e *Engine) calculateReverseSlippage(leg1, reverse FillResult) float64 {
-	// Cost basis must be scaled to the quantity actually being reversed,
-	// not leg1's total filled quantity. When leg2 partially fills, only
-	// the residual (leg1.FilledQty - leg2.FilledQty) gets reversed here —
-	// pricing the full leg1 position against a partial liquidation
-	// produces a phantom PnL swing (e.g. costing 0.01 BTC against a
-	// 0.006 BTC sale). reverse.FilledQty is the reliable quantity anchor
-	// since submitIOC/reverseHedge already guarantee it's <= the residual
-	// requested.
 	costGross := leg1.AvgPrice * reverse.FilledQty
 	costFee := costGross * e.getTakerFeeRate(leg1.Exchange)
 	liqGross := reverse.AvgPrice * reverse.FilledQty
