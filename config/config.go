@@ -12,59 +12,55 @@ import (
 )
 
 type RiskParams struct {
-	MaxLatencyMS   int64
-	DailyLossLimit float64
-	MaxDrawdown    float64
-	LegTimeoutMs   int64
+	MaxLatencyMS    int64
+	DailyLossLimit  float64
+	MaxDrawdown     float64
+	LegTimeoutMs    int64
 	LegTimeoutMsByVenue map[string]int64
 	MaxOrdersPerSec int
 	KillSwitchArmed bool
-
-	// OperatorTokenHash is the SHA-256 hex digest of the operator token.
-	// The raw token is never stored in configuration or logs.
 	OperatorTokenHash string
-
 	MaxPositionUSD float64
 	MinPositionUSD float64
-	BaseRiskPct    float64
+	BaseRiskPct float64
 }
 
 type FeeSchedule struct {
 	BinanceUSDM float64
-	KrakenPerp  float64
-	AlpacaSpot  float64
-	FIXDirect   float64
-	Default     float64
+	KrakenPerp float64
+	AlpacaSpot float64
+	FIXDirect float64
+	Default float64
 }
 
 type ExchangeConfig struct {
-	BinanceWSURL     string
-	BinanceAPIKey    string
+	BinanceWSURL string
+	BinanceAPIKey string
 	BinanceAPISecret string
-	KrakenWSURL      string
-	KrakenAPIKey     string
-	KrakenAPISecret  string
-	AlpacaWSURL      string
-	AlpacaAPIKey     string
-	AlpacaAPISecret  string
-	FIXGatewayURL    string
-	FIXSenderCompID  string
-	FIXTargetCompID  string
-	FIXUsername      string
-	FIXPassword      string
+	KrakenWSURL string
+	KrakenAPIKey string
+	KrakenAPISecret string
+	AlpacaWSURL string
+	AlpacaAPIKey string
+	AlpacaAPISecret string
+	FIXGatewayURL string
+	FIXSenderCompID string
+	FIXTargetCompID string
+	FIXUsername string
+	FIXPassword string
 }
 
 type Config struct {
-	RedisAddr   string
+	RedisAddr string
 	PostgresURL string
 	GatewayAddr string
-	Exchange    ExchangeConfig
-	RiskParams  RiskParams
-	Fees        FeeSchedule
+	Exchange ExchangeConfig
+	RiskParams RiskParams
+	Fees FeeSchedule
 	StreamFlushInterval time.Duration
-	StreamMaxBatchSize  int
-	TelemetryStreamKey  string
-	ExecutionStreamKey  string
+	StreamMaxBatchSize int
+	TelemetryStreamKey string
+	ExecutionStreamKey string
 }
 
 func Load() *Config {
