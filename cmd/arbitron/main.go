@@ -117,15 +117,12 @@ func main() {
 	go execEngine.Start(ctx)
 	log.Println("✅ Execution engine started")
 
-	// ── GAP FILLED: the detector was never started ────────────
-	// detector.go exists, compiles, and is fully implemented, but
-	// nothing in the original main.go constructed or started it.
-	// Without this, PublishTick() has no subscriber and no
-	// ArbOpportunity is ever generated — the whole system would
-	// run with a live execution engine that never receives work.
-	detector := execution.NewDetector(cfg, execEngine)
+	// Opportunities are executable only while both source venues have a
+	// live, fresh feed. The detector receives FeedManager's health state and
+	// therefore fails closed during disconnect/reconnect/stale-feed windows.
+	detector := execution.NewDetector(cfg, execEngine, feedManager)
 	go detector.Start(ctx, pipeline)
-	log.Println("✅ Arbitrage detector started")
+	log.Println("✅ Arbitrage detector started with venue-health gate")
 
 	gateway := telemetry.NewGateway(cfg.GatewayAddr, pipeline, riskEngine, registry)
 	go func() {
